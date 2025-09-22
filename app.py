@@ -4,6 +4,7 @@ import pandas as pd
 from mlflow.tracking import MlflowClient
 from flask import Flask, request, jsonify
 import os
+import random
 
 client = MlflowClient()
 
@@ -11,6 +12,9 @@ MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:50
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
 REGISTERED_MODEL_NAME = "sk-learn-random-forest-reg-model"
+
+# Canary deployment configuration
+CANARY_PROBABILITY = float(os.environ.get("CANARY_PROBABILITY", "0.1"))  # 10% by default
 
 def load_model(version="latest"):
     try:
@@ -39,7 +43,11 @@ def load_model(version="latest"):
             print(f"Fallback loading failed: {fallback_error}")
             raise Exception(f"Failed to load model: {e}")
 
-model = load_model(version="latest")
+# Initialize both current and next models at startup
+current_model = load_model(version="latest")
+next_model = load_model(version="latest")  # Start with same model
+print(f"Initialized canary deployment with probability: {CANARY_PROBABILITY}")
+print("Both current and next models loaded successfully")
 
 app = Flask(__name__)
 
@@ -50,32 +58,61 @@ def hello_world():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    global model
+    global current_model, next_model
     try:
         json_data = request.get_json()
         features = json_data.get("features", [])
         data = pd.DataFrame(features)
-        preds = model.predict(data)
-        return jsonify({"predictions": preds.tolist()})
+        
+        # Canary deployment: choose model based on probability
+        use_next = random.random() < CANARY_PROBABILITY
+        selected_model = next_model if use_next else current_model
+        model_type = "next" if use_next else "current"
+        
+        preds = selected_model.predict(data)
+        
+        return jsonify({
+            "predictions": preds.tolist(),
+            "model_used": model_type,
+            "canary_probability": CANARY_PROBABILITY
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/update-model", methods=["POST"])
 def update_model():
-    global model
+    global next_model
     try:
         json_data = request.get_json()
-        version = json_data.get("version", None)
+        version = json_data.get("version", "latest")
 
         # Vérifier que la version/stage existe
-        if version:
+        if version != "latest":
             versions = [mv.version for mv in client.search_model_versions(f"name='{REGISTERED_MODEL_NAME}'")]
             if version not in [int(v) for v in versions]:
                 return jsonify({"error": f"Version {version} does not exist."}), 400
 
-        # Charger le modèle
-        model = load_model(version=version)
-        return jsonify({"message": f"Model updated successfully (version={version})"})
+        # Charger le nouveau modèle comme "next model"
+        next_model = load_model(version=version)
+        return jsonify({
+            "message": f"Next model updated successfully (version={version})",
+            "canary_probability": CANARY_PROBABILITY,
+            "note": "Use /accept-next-model to promote this model to current"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/accept-next-model", methods=["POST"])
+def accept_next_model():
+    global current_model, next_model
+    try:
+        # Promote next model to current
+        current_model = next_model
+        return jsonify({
+            "message": "Next model promoted to current successfully",
+            "note": "Both current and next models are now the same",
+            "canary_probability": CANARY_PROBABILITY
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
